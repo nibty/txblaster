@@ -13,6 +13,9 @@ import (
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/params"
 	hdwallet "github.com/miguelmota/go-ethereum-hdwallet"
+	"golang.org/x/text/language"
+	"golang.org/x/text/message"
+	"sync/atomic"
 	"time"
 
 	"math/big"
@@ -56,6 +59,8 @@ type BalanceResult struct {
 	Balance *big.Int
 }
 
+// NewBlaster creates a new Blaster instance with the provided parameters.
+// rpcUrl: The URL of the RPC server.
 func NewBlaster(
 	rpcUrl string,
 	funderPrivateKey string,
@@ -87,7 +92,6 @@ func (b *Blaster) connect() {
 	if err != nil {
 		log.Crit("Failed to connect to the Ethereum client", "err", err)
 	}
-	//defer b.client.Close()
 }
 
 func (b *Blaster) prepareFunderAccount() Funder {
@@ -136,6 +140,8 @@ func (b *Blaster) generateAccounts(numAccounts int) (*hdwallet.Wallet, []account
 	return wallet, accts
 }
 
+// Prepare sets up the Blaster by connecting to the Ethereum client, preparing the funder account,
+// getting the chain ID, and generating the accounts.
 func (b *Blaster) Prepare() {
 	b.ctx = context.Background()
 	b.connect()
@@ -145,13 +151,25 @@ func (b *Blaster) Prepare() {
 	b.wallet, b.accounts = b.generateAccounts(b.numAccounts)
 
 	b.gappedService = NewGappedService(b.ctx, b.client, b.chainId, b.numWorkers)
-	b.gappedService.updateQueued()
+	b.gappedService.Update()
 
 	b.transaction = NewTransaction(b.ctx, b.client, b.chainId, b.gas, b.maxGasFee, b.maxGasPriorityFee)
 }
 
+// FundAccounts funds the accounts managed by the Blaster. Each account is funded with the specified amount.
+// fundValue: The amount to fund each account.
 func (b *Blaster) FundAccounts(fundValue int) {
-	fundValueWei := new(big.Int).Mul(big.NewInt(int64(fundValue)), big.NewInt(params.Ether))
+	// check pending transactions
+	for {
+		if b.gappedService.CheckPendingByAddress(b.funder.Address) {
+			log.Info("Found pending TXs. Waiting for 30 seconds...", "address", b.funder.Address.Hex())
+			time.Sleep(30 * time.Second)
+		} else {
+			break
+		}
+
+		b.gappedService.Update()
+	}
 
 	// Fill gaps in the funder account if needed
 	b.gappedService.FillGaps(b.funder.Address, b.funder.PrivateKey)
@@ -162,6 +180,50 @@ func (b *Blaster) FundAccounts(fundValue int) {
 		log.Crit("Failed to get account nonce", "err", err)
 	}
 	log.Debug("Funder Nonce", "address", b.funder.Address, "nonce", nonce)
+
+	// Check balances
+	accountsNeedingFunding := b.checkBalances(fundValue, nonce)
+	numOfJobs := len(accountsNeedingFunding)
+
+	if numOfJobs == 0 {
+		log.Info("No accounts need funding")
+		return
+	}
+
+	jobs := make(chan *AccountJob, numOfJobs)
+	results := make(chan *types.Receipt, numOfJobs)
+
+	// Start workers
+	for w := 1; w <= b.numWorkers; w++ {
+		go b.fundWorker(w, jobs, results) // Pass the nonces map to the fundWorker
+	}
+
+	// Create jobs
+	for _, account := range accountsNeedingFunding {
+		jobs <- account
+	}
+	close(jobs)
+
+	log.Info("Need to fund accounts. Starting funder now...", "numAccounts", numOfJobs)
+
+	// Start a goroutine that logs the progress every 30 seconds
+	var processedAccounts int32 = 0
+	quitProgress := make(chan bool)
+	go progressLogger(&processedAccounts, int32(numOfJobs), "Funding Accounts Report", quitProgress)
+
+	// Collect results
+	for range numOfJobs {
+		txHash := <-results
+		if !b.noWait {
+			log.Debug("TX confirmed", "from", b.funder.Address.Hex(), "to", txHash.TxHash.Hex())
+		}
+		atomic.AddInt32(&processedAccounts, 1)
+	}
+	quitProgress <- true
+}
+
+func (b *Blaster) checkBalances(fundValue int, nonce uint64) []*AccountJob {
+	desiredBalance := new(big.Int).Mul(big.NewInt(int64(fundValue)), big.NewInt(params.Ether))
 
 	balanceJobs := make(chan accounts.Account, len(b.accounts))
 	balanceResults := make(chan *BalanceResult, len(b.accounts))
@@ -176,49 +238,50 @@ func (b *Blaster) FundAccounts(fundValue int) {
 	}
 	close(balanceJobs)
 
-	numJobs := 0
+	log.Info("Checking account balances...")
 	accountsNeedingFunding := make([]*AccountJob, 0)
 	for range len(b.accounts) {
 		balanceResult := <-balanceResults
 		log.Trace("Account balance", "address", balanceResult.Account.Address.Hex(), "balance", ToDecimal(balanceResult.Balance, 18))
-		desiredBalance := new(big.Int).Mul(fundValueWei, big.NewInt(80))
-		desiredBalance.Div(desiredBalance, big.NewInt(100))
 
 		if balanceResult.Balance.Cmp(desiredBalance) < 0 {
-			log.Info("Account needs funding", "address", balanceResult.Account.Address.Hex(), "balance", ToDecimal(balanceResult.Balance, 18), "desired", ToDecimal(desiredBalance, 18))
+			log.Debug("Account needs funding", "address", balanceResult.Account.Address.Hex(), "balance", ToDecimal(balanceResult.Balance, 18), "desired", ToDecimal(desiredBalance, 18))
 			difference := new(big.Int).Sub(desiredBalance, balanceResult.Balance)
 			accountsNeedingFunding = append(accountsNeedingFunding, &AccountJob{Account: balanceResult.Account, Difference: difference, Nonce: nonce})
 			nonce++
-			numJobs++
 		} else {
-			log.Info("Account does not need funding", "address", balanceResult.Account.Address.Hex(), "balance", ToDecimal(balanceResult.Balance, 18), "desired", ToDecimal(desiredBalance, 18))
+			log.Debug("Account does not need funding", "address", balanceResult.Account.Address.Hex(), "balance", ToDecimal(balanceResult.Balance, 18), "desired", ToDecimal(desiredBalance, 18))
 		}
 	}
 
-	jobs := make(chan *AccountJob, len(accountsNeedingFunding))
-	results := make(chan *types.Receipt, len(accountsNeedingFunding))
+	return accountsNeedingFunding
+}
 
-	// Start workers
-	for w := 1; w <= b.numWorkers; w++ {
-		go b.fundWorker(w, jobs, results) // Pass the nonces map to the fundWorker
-	}
+func progressLogger(processed *int32, total int32, title string, quit chan bool) {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
 
-	// Create jobs
-	for _, account := range accountsNeedingFunding {
-		jobs <- account
-	}
-	close(jobs)
-
-	log.Debug("need to fund accounts", "numAccounts", numJobs)
-
-	// Collect results
-	for range len(accountsNeedingFunding) {
-		txHash := <-results
-		if txHash != nil {
-			if !b.noWait {
-				log.Debug("TX confirmed", "from", b.funder.Address.Hex(), "to", txHash.TxHash.Hex())
-			}
+	for {
+		select {
+		case <-quit:
+			processed := atomic.LoadInt32(processed)
+			printProgressMsg(&processed, total, title)
+			return
+		case <-ticker.C:
+			processed := atomic.LoadInt32(processed)
+			printProgressMsg(&processed, total, title)
 		}
+	}
+}
+
+func printProgressMsg(processed *int32, total int32, title string) {
+	p := message.NewPrinter(language.English)
+
+	if total > 0 {
+		percent := float64(*processed) / float64(total) * 100
+		log.Info(title, "processed", p.Sprint(*processed), "total", p.Sprint(total), "percent", percent)
+	} else {
+		log.Info(title, "processed", p.Sprint(*processed))
 	}
 }
 
@@ -246,16 +309,18 @@ func (b *Blaster) fundWorker(id int, jobs <-chan *AccountJob, results chan<- *ty
 		if err != nil {
 			log.Crit("Failed to wait for transaction to be mined", "err", err)
 		}
-		log.Info("TX confirmed", "from", b.funder.Address.Hex(), "to", txHash.TxHash.Hex())
+		log.Debug("TX confirmed", "from", b.funder.Address.Hex(), "to", txHash.TxHash.Hex())
 		results <- txHash
 	}
 }
 
+// RunTests runs the tests, which involve sending transactions from each account to the funder account.
+// value: The value to send in each transaction (in wei).
 func (b *Blaster) RunTests(value uint64) {
-	b.gappedService.updateQueued()
+	b.gappedService.Update()
 
 	// prepare the accounts in batches per worker, grab their nonce, private key, and fill any nonce gaps
-	log.Info("Preparing accounts and checking for nonce gaps")
+	log.Info("Preparing accounts")
 	batches := SplitAccountsIntoBatches(b.accounts, b.numWorkers)
 
 	// prepare the accounts in batches per worker, grab their nonce and private key
@@ -279,9 +344,6 @@ func (b *Blaster) RunTests(value uint64) {
 					log.Crit("Failed to get account nonce", "err", err)
 				}
 				account.Nonce = nonce
-
-				// fill any nonce gaps
-				b.gappedService.FillGaps(account.Account.Address, account.PrivateKey)
 			}
 		}()
 	}
@@ -305,6 +367,10 @@ func (b *Blaster) RunTests(value uint64) {
 		}
 	}
 
+	var processedTxs int32 = 0
+	quitProgress := make(chan bool)
+	go progressLogger(&processedTxs, 0, "Blaster Report", quitProgress)
+
 	log.Info("Start the blasting!")
 	for _, batch := range batches {
 		wg.Add(1)
@@ -326,10 +392,13 @@ func (b *Blaster) RunTests(value uint64) {
 						log.Crit("Failed to wait for tx confirmation", "from", acc.Account.Address, "err", err)
 					}
 					elapsed := float64(time.Now().UnixMilli()-start) / 1000.0
-					log.Info("TX confirmed", "from", acc.Account.Address.Hex(), "to", mined.TxHash.String(), "elapsed", elapsed)
+					log.Debug("TX confirmed", "from", acc.Account.Address.Hex(), "to", mined.TxHash.String(), "elapsed", elapsed)
+
+					atomic.AddInt32(&processedTxs, 1)
 				}
 			}
 		}(batch)
 	}
 	wg.Wait()
+	quitProgress <- true
 }

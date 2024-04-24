@@ -56,7 +56,7 @@ func (b *transaction) send(privateKey *ecdsa.PrivateKey, fromAddress common.Addr
 
 	err := error(nil)
 
-	log.Info("Send TX",
+	log.Debug("Send TX",
 		"from", fromAddress.Hex(),
 		"to", toAddress,
 		"nonce", nonce,
