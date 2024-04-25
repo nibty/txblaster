@@ -56,6 +56,9 @@ func main() {
 	shouldFunTests := flag.Bool("run-tests", true, "Run the tests")
 	verbosity := flag.Int("verbosity", 3, "The log verbosity")
 	waitForTx := flag.Float64("confirm-wait", 1.2, "The time to wait before checking the tx confirmation (in seconds)")
+	xenTorrentAddress := flag.String("xen-torrent-address", "", "The XenTorrent contract address")
+	xenTorrentTerm := flag.Int64("term", 1, "The XenTorrent term")
+	xenTorrentVmus := flag.Int64("vmus", 1, "The XenTorrent vmus")
 
 	flag.Parse()
 	if flag.Arg(0) == "-h" || flag.Arg(0) == "--help" {
@@ -66,7 +69,21 @@ func main() {
 	logger = log.NewLogger(log.NewTerminalHandlerWithLevel(os.Stdout, log.FromLegacyLevel(*verbosity), true))
 	log.SetDefault(logger)
 
-	blaster := NewBlaster(*rpc, privateKey, mnemonic, *workers, *accounts, *noWait, *gas, *maxGasFee, *maxGasPriorityFee, *waitForTx)
+	blaster := NewBlaster(
+		*rpc,
+		privateKey,
+		mnemonic,
+		*workers,
+		*accounts,
+		*noWait,
+		*gas,
+		*maxGasFee,
+		*maxGasPriorityFee,
+		*xenTorrentAddress,
+		*xenTorrentTerm,
+		*xenTorrentVmus,
+		*waitForTx,
+	)
 	blaster.Prepare()
 
 	if *shouldFundAccounts {

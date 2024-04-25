@@ -34,18 +34,18 @@ type Blaster struct {
 	maxGasFee         uint64
 	maxGasPriorityFee uint64
 	waitForTx         float64
-	funder            Funder
-	accounts          []accounts.Account
-	wallet            *hdwallet.Wallet
-	ctx               context.Context
-	client            *ethclient.Client
-	gappedService     *GappedService
-	transaction       *transaction
-}
+	xenTorrentAddress common.Address
+	xenTorrentTerm    int64
+	xenTorrentVMus    int64
 
-type Funder struct {
-	PrivateKey *ecdsa.PrivateKey
-	Address    common.Address
+	funder        *PrivateKeyAccount
+	accounts      []accounts.Account
+	wallet        *hdwallet.Wallet
+	ctx           context.Context
+	client        *ethclient.Client
+	gappedService *GappedService
+	transaction   *transaction
+	xenCrypto     *XenCrypto
 }
 
 type AccountJob struct {
@@ -71,6 +71,9 @@ func NewBlaster(
 	gas uint64,
 	maxGasFee uint64,
 	maxGasPriorityFee uint64,
+	xenTorrentAddress string,
+	xenTorrentTerm int64,
+	xenTorrentVMus int64,
 	waitForTx float64) *Blaster {
 	return &Blaster{
 		rpcUrl:            rpcUrl,
@@ -83,6 +86,9 @@ func NewBlaster(
 		maxGasFee:         maxGasFee,
 		maxGasPriorityFee: maxGasPriorityFee,
 		waitForTx:         waitForTx,
+		xenTorrentAddress: common.HexToAddress(xenTorrentAddress),
+		xenTorrentTerm:    xenTorrentTerm,
+		xenTorrentVMus:    xenTorrentVMus,
 	}
 }
 
@@ -94,7 +100,7 @@ func (b *Blaster) connect() {
 	}
 }
 
-func (b *Blaster) prepareFunderAccount() Funder {
+func (b *Blaster) PreparePrivateKeyAccount() PrivateKeyAccount {
 	pk, err := crypto.HexToECDSA(b.funderPrivateKey)
 	if err != nil {
 		log.Crit("Failed to parse private key", "err", err)
@@ -105,7 +111,7 @@ func (b *Blaster) prepareFunderAccount() Funder {
 		log.Crit("Failed casting public key to ECDSA")
 	}
 	fromAddress := crypto.PubkeyToAddress(*publicKeyECDSA)
-	return Funder{
+	return PrivateKeyAccount{
 		PrivateKey: pk,
 		Address:    fromAddress,
 	}
@@ -146,7 +152,7 @@ func (b *Blaster) Prepare() {
 	b.ctx = context.Background()
 	b.connect()
 
-	b.funder = b.prepareFunderAccount()
+	b.funder = NewPrivateKeyAccount(b.funderPrivateKey)
 	b.chainId = b.getChainId()
 	b.wallet, b.accounts = b.generateAccounts(b.numAccounts)
 
@@ -154,6 +160,8 @@ func (b *Blaster) Prepare() {
 	b.gappedService.Update()
 
 	b.transaction = NewTransaction(b.ctx, b.client, b.chainId, b.gas, b.maxGasFee, b.maxGasPriorityFee)
+
+	b.xenCrypto = NewXenCrypto(b.ctx, b.client, b.chainId, b.gas, b.maxGasFee, b.maxGasPriorityFee, b.xenTorrentAddress)
 }
 
 // FundAccounts funds the accounts managed by the Blaster. Each account is funded with the specified amount.
@@ -179,7 +187,7 @@ func (b *Blaster) FundAccounts(fundValue int) {
 	if err != nil {
 		log.Crit("Failed to get account nonce", "err", err)
 	}
-	log.Debug("Funder Nonce", "address", b.funder.Address, "nonce", nonce)
+	log.Debug("PrivateKeyAccount Nonce", "address", b.funder.Address, "nonce", nonce)
 
 	// Check balances
 	accountsNeedingFunding := b.checkBalances(fundValue, nonce)
@@ -379,10 +387,17 @@ func (b *Blaster) RunTests(value uint64) {
 
 			for {
 				for _, acc := range accs {
-					signTx, err := b.transaction.send(acc.PrivateKey, acc.Account.Address, b.funder.Address, big.NewInt(0).SetUint64(value), acc.Nonce)
+					var signTx *types.Transaction
+					var err error
+					if b.xenTorrentAddress != common.HexToAddress("0x0") {
+						signTx, err = b.xenCrypto.MintXeNFT(acc.PrivateKey, acc.Nonce, b.xenTorrentTerm, b.xenTorrentVMus)
+					} else {
+						signTx, err = b.transaction.send(acc.PrivateKey, acc.Account.Address, b.funder.Address, big.NewInt(0).SetUint64(value), acc.Nonce)
+					}
 					if err != nil {
 						log.Crit("Failed to send transaction", "from", acc.Account.Address, "err", err)
 					}
+
 					acc.Nonce++
 
 					start := time.Now().UnixMilli()
